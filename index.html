@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 万条列表 + 帧率监控</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8;
+    color: #222;
+  }
+  #hud {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 10;
+    background: #1e2430;
+    color: #e8ecf3;
+    padding: 8px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 20px;
+    align-items: center;
+    font-size: 13px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.25);
+  }
+  #hud .stat b { color: #6ee7a8; font-variant-numeric: tabular-nums; }
+  #hud .stat.warn b { color: #ffb454; }
+  #fpsCanvas {
+    display: block;
+    width: 220px;
+    height: 48px;
+    background: #12161f;
+    border-radius: 4px;
+  }
+  #modeBadge {
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: #2f7d4f;
+    font-size: 12px;
+  }
+  #modeBadge.degraded { background: #b0622a; }
+  #list {
+    padding-top: 64px; /* 给固定 HUD 留位置 */
+  }
+  .item {
+    padding: 8px 16px;
+    border-bottom: 1px solid #e3e5e9;
+    background: #fff;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .item:nth-child(even) { background: #fafbfc; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <canvas id="fpsCanvas" width="440" height="96"></canvas>
+  <span class="stat">FPS: <b id="fps">--</b></span>
+  <span class="stat">掉帧次数: <b id="drops">0</b></span>
+  <span class="stat">最长单帧: <b id="maxFrame">0</b> ms</span>
+  <span class="stat">已渲染项: <b id="rendered">0</b> / 100000</span>
+  <span id="modeBadge">标准模式</span>
+</div>
+
+<div id="list"></div>
+
+<script>
+'use strict';
+
+/* ================= 配置 ================= */
+const TOTAL_ITEMS = 100000;
+const CHUNK_SIZE = 2000;          // 每帧插入的项数，分块渲染避免长时间阻塞
+const DROP_THRESHOLD_MS = 50;     // 单帧超过该值记为一次掉帧
+const HISTORY_LEN = 120;          // FPS 曲线保留的采样点数
+
+/* ================= 状态 ================= */
+const state = {
+  rendered: 0,
+  drops: 0,
+  maxFrame: 0,
+  fps: 0,
+  degraded: false,          // 低端设备降级：降低采样与绘制频率
+  sampleInterval: 1,        // 每 N 帧采样一次（降级时增大）
+  frameCount: 0,
+  fpsHistory: [],
+  lastFrameTime: 0,
+  frameTimes: [],           // 1 秒窗口内的帧耗时，用于计算 FPS
+  hidden: false,
+};
+
+const els = {
+  list: document.getElementById('list'),
+  fps: document.getElementById('fps'),
+  drops: document.getElementById('drops'),
+  maxFrame: document.getElementById('maxFrame'),
+  rendered: document.getElementById('rendered'),
+  canvas: document.getElementById('fpsCanvas'),
+  badge: document.getElementById('modeBadge'),
+};
+const ctx = els.canvas.getContext('2d');
+
+/* ================= 低端设备检测与降级 ================= */
+function detectLowEnd() {
+  const cores = navigator.hardwareConcurrency || 4;
+  const mem = navigator.deviceMemory || 4;
+  return cores <= 2 || mem <= 2;
+}
+
+function setDegraded(on) {
+  if (state.degraded === on) return;
+  state.degraded = on;
+  state.sampleInterval = on ? 4 : 1; // 降级后每 4 帧采样一次
+  els.badge.textContent = on ? '降级模式（低采样）' : '标准模式';
+  els.badge.classList.toggle('degraded', on);
+}
+
+/* ================= 列表渲染（分块） ================= */
+function renderChunk() {
+  const frag = document.createDocumentFragment();
+  const end = Math.min(state.rendered + CHUNK_SIZE, TOTAL_ITEMS);
+  for (let i = state.rendered; i < end; i++) {
+    const div = document.createElement('div');
+    div.className = 'item';
+    div.textContent = '列表项 #' + (i + 1) + ' —— 纯文本内容，用于滚动性能测试';
+    frag.appendChild(div);
+  }
+  els.list.appendChild(frag);
+  state.rendered = end;
+  els.rendered.textContent = state.rendered;
+  if (end < TOTAL_ITEMS) {
+    requestAnimationFrame(renderChunk);
+  }
+}
+
+/* ================= FPS 曲线绘制 ================= */
+function drawCurve() {
+  const w = els.canvas.width;
+  const h = els.canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // 60 FPS 参考线
+  ctx.strokeStyle = 'rgba(110,231,168,.35)';
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  const refY = h - (60 / 120) * h;
+  ctx.moveTo(0, refY);
+  ctx.lineTo(w, refY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const hist = state.fpsHistory;
+  if (hist.length < 2) return;
+  ctx.strokeStyle = '#6ee7a8';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < hist.length; i++) {
+    const x = (i / (HISTORY_LEN - 1)) * w;
+    const y = h - (Math.min(hist[i], 120) / 120) * h;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+/* ================= 帧率监控主循环 ================= */
+function monitorLoop(now) {
+  requestAnimationFrame(monitorLoop);
+
+  if (state.hidden) return;               // 后台标签页：rAF 本就会暂停，双保险
+  if (state.lastFrameTime === 0) {        // 首帧 / 后台恢复后的第一帧，只记录基线
+    state.lastFrameTime = now;
+    return;
+  }
+
+  const delta = now - state.lastFrameTime;
+  state.lastFrameTime = now;
+
+  // 异常巨大的间隔（如后台恢复残留）直接丢弃，不纳入统计
+  if (delta > 1000) return;
+
+  // 掉帧与最长单帧统计（每一帧都统计，保证准确）
+  if (delta > DROP_THRESHOLD_MS) state.drops++;
+  if (delta > state.maxFrame) state.maxFrame = delta;
+
+  state.frameTimes.push({ time: now, delta });
+
+  // 采样节流：降级模式下减少 UI 更新与绘制频率
+  state.frameCount++;
+  if (state.frameCount % state.sampleInterval !== 0) return;
+
+  // 用最近 1 秒窗口计算 FPS
+  const cutoff = now - 1000;
+  while (state.frameTimes.length && state.frameTimes[0].time < cutoff) {
+    state.frameTimes.shift();
+  }
+
+  updateHUD(now);
+}
+
+let lastHudUpdate = 0;
+function updateHUD(now) {
+  // 标准模式每 250ms 刷新一次 HUD，降级模式每 1000ms
+  const interval = state.degraded ? 1000 : 250;
+  if (now - lastHudUpdate < interval) return;
+  lastHudUpdate = now;
+
+  const count = state.frameTimes.length;
+  state.fps = count; // 1 秒窗口内的帧数即 FPS
+
+  els.fps.textContent = state.fps;
+  els.drops.textContent = state.drops;
+  els.maxFrame.textContent = state.maxFrame.toFixed(1);
+  els.rendered.textContent = state.rendered;
+
+  state.fpsHistory.push(state.fps);
+  if (state.fpsHistory.length > HISTORY_LEN) state.fpsHistory.shift();
+  drawCurve();
+
+  // 运行时自动降级：持续低 FPS 则切换到低采样模式
+  if (!state.degraded && state.fpsHistory.length >= 8) {
+    const recent = state.fpsHistory.slice(-8);
+    const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
+    if (avg < 20) setDegraded(true);
+  }
+}
+
+/* ================= PerformanceObserver：长任务 ================= */
+if ('PerformanceObserver' in window) {
+  try {
+    const observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        // 长任务（>50ms）同样计入掉帧统计，并竞争最长单帧
+        state.drops++;
+        if (entry.duration > state.maxFrame) {
+          state.maxFrame = entry.duration;
+        }
+      }
+    });
+    observer.observe({ entryTypes: ['longtask'] });
+  } catch (e) {
+    // 某些浏览器不支持 longtask，忽略即可，rAF 统计仍然有效
+  }
+}
+
+/* ================= 后台标签页恢复 ================= */
+document.addEventListener('visibilitychange', () => {
+  state.hidden = document.hidden;
+  if (!document.hidden) {
+    // 恢复时重置基线，避免把后台停留时长算成一帧
+    state.lastFrameTime = 0;
+    state.frameTimes.length = 0;
+  }
+});
+
+/* ================= 窗口大小变化：重设 Canvas 尺寸 ================= */
+if ('ResizeObserver' in window) {
+  const ro = new ResizeObserver(() => {
+    const ratio = window.devicePixelRatio || 1;
+    const cssW = els.canvas.clientWidth || 220;
+    const cssH = els.canvas.clientHeight || 48;
+    els.canvas.width = cssW * ratio;
+    els.canvas.height = cssH * ratio;
+    drawCurve(); // 尺寸变化后立即重绘，监控不中断
+  });
+  ro.observe(els.canvas);
+}
+
+/* ================= 启动 ================= */
+if (detectLowEnd()) setDegraded(true);
+requestAnimationFrame(renderChunk);
+requestAnimationFrame(monitorLoop);
+</script>
+</body>
+</html>
