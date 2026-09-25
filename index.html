@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 万条列表 · 帧率监控</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", monospace, sans-serif;
+    background: #1e1f24;
+    color: #d7d9e0;
+    overflow: hidden;
+  }
+  #hud {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 10;
+    background: rgba(24, 25, 30, 0.95);
+    border-bottom: 1px solid #33363f;
+    padding: 8px 12px;
+    backdrop-filter: blur(4px);
+  }
+  #stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  #stats .item { white-space: nowrap; }
+  #stats .label { color: #8a8f9c; }
+  #stats .value { color: #6ee7a0; font-weight: 600; }
+  #stats .value.warn { color: #f5c542; }
+  #stats .value.bad  { color: #f56565; }
+  #fpsCanvas {
+    display: block;
+    width: 100%;
+    height: 64px;
+    margin-top: 6px;
+    background: #14151a;
+    border-radius: 4px;
+  }
+  #listContainer {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    background: #1e1f24;
+  }
+  .row {
+    padding: 6px 14px;
+    font-size: 14px;
+    line-height: 1.5;
+    border-bottom: 1px solid #26272e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .row:nth-child(odd) { background: #22232a; }
+  #statusBar {
+    position: fixed;
+    right: 12px;
+    bottom: 12px;
+    z-index: 10;
+    font-size: 12px;
+    color: #8a8f9c;
+    background: rgba(24,25,30,.9);
+    padding: 4px 10px;
+    border-radius: 4px;
+    border: 1px solid #33363f;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div id="stats">
+    <span class="item"><span class="label">FPS</span> <span class="value" id="fps">--</span></span>
+    <span class="item"><span class="label">掉帧次数</span> <span class="value" id="dropped">0</span></span>
+    <span class="item"><span class="label">最长单帧</span> <span class="value" id="longest">0.0 ms</span></span>
+    <span class="item"><span class="label">已渲染项</span> <span class="value" id="rendered">0</span></span>
+    <span class="item"><span class="label">长任务(&gt;50ms)</span> <span class="value" id="longtasks">0</span></span>
+    <span class="item"><span class="label">模式</span> <span class="value" id="mode">标准</span></span>
+  </div>
+  <canvas id="fpsCanvas"></canvas>
+</div>
+
+<div id="listContainer"></div>
+<div id="statusBar">初始化中…</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var TOTAL = 100000;
+
+  // ---------- 低端设备检测与降级 ----------
+  var cores = navigator.hardwareConcurrency || 4;
+  var memory = navigator.deviceMemory || 8;
+  var lowEnd = cores <= 4 || memory <= 4;
+
+  // 采样配置（低端设备自动降低采样频率）
+  var config = {
+    hudInterval:   lowEnd ? 500 : 250,   // HUD 数字刷新间隔 (ms)
+    curveInterval: lowEnd ? 200 : 100,   // FPS 曲线采样间隔 (ms)
+    batchSize:     lowEnd ? 300 : 800,   // 每帧渲染的列表项数
+    curveWindow:   lowEnd ? 150 : 300    // 曲线保留的采样点数
+  };
+
+  var modeEl = document.getElementById('mode');
+  modeEl.textContent = lowEnd ? '低端降级' : '标准';
+  if (lowEnd) modeEl.classList.add('warn');
+
+  // ---------- DOM 引用 ----------
+  var fpsEl      = document.getElementById('fps');
+  var droppedEl  = document.getElementById('dropped');
+  var longestEl  = document.getElementById('longest');
+  var renderedEl = document.getElementById('rendered');
+  var longtasksEl = document.getElementById('longtasks');
+  var statusBar  = document.getElementById('statusBar');
+  var container  = document.getElementById('listContainer');
+  var hud        = document.getElementById('hud');
+  var canvas     = document.getElementById('fpsCanvas');
+  var ctx        = canvas.getContext('2d');
+
+  // ---------- 帧率监控状态 ----------
+  var frameCount = 0;
+  var droppedFrames = 0;
+  var longestFrame = 0;        // 最长单帧耗时 (ms)
+  var longtaskCount = 0;
+  var lastFrameTime = 0;
+  var fpsWindowStart = 0;
+  var fpsWindowFrames = 0;
+  var currentFps = 0;
+  var fpsHistory = [];         // { t, fps }
+  var monitorRunning = true;
+  var hiddenAt = 0;
+
+  // 帧预算：默认按 60Hz，运行时根据实际刷新率自适应
+  var frameBudget = 1000 / 60;
+  var budgetSamples = [];
+
+  // ---------- PerformanceObserver：长任务 ----------
+  if (window.PerformanceObserver) {
+    try {
+      var po = new PerformanceObserver(function (list) {
+        var entries = list.getEntries();
+        for (var i = 0; i < entries.length; i++) {
+          longtaskCount++;
+          // 长任务期间的主线程阻塞也视为掉帧来源
+          var dur = entries[i].duration;
+          if (dur > longestFrame) longestFrame = dur;
+        }
+        longtasksEl.textContent = String(longtaskCount);
+      });
+      po.observe({ entryTypes: ['longtask'] });
+    } catch (e) {
+      longtasksEl.textContent = 'N/A';
+    }
+  } else {
+    longtasksEl.textContent = 'N/A';
+  }
+
+  // ---------- rAF 帧率测量 ----------
+  function frameLoop(now) {
+    if (!monitorRunning) return;
+
+    if (lastFrameTime > 0) {
+      var delta = now - lastFrameTime;
+
+      // 后台标签页恢复后的第一帧不算入统计（间隙由挂起造成，非真实渲染耗时）
+      if (delta < 1000) {
+        frameCount++;
+        fpsWindowFrames++;
+
+        // 自适应帧预算：取最近正常帧间隔的中位数
+        if (delta > 4 && delta < 50) {
+          budgetSamples.push(delta);
+          if (budgetSamples.length > 120) budgetSamples.shift();
+          if (budgetSamples.length >= 30 && frameCount % 60 === 0) {
+            var sorted = budgetSamples.slice().sort(function (a, b) { return a - b; });
+            frameBudget = sorted[Math.floor(sorted.length / 2)];
+          }
+        }
+
+        // 掉帧判定：帧间隔超过 1.5 倍预算（约漏掉半帧以上）
+        if (delta > frameBudget * 1.5) {
+          droppedFrames += Math.max(1, Math.round(delta / frameBudget) - 1);
+        }
+
+        if (delta > longestFrame) longestFrame = delta;
+      }
+    }
+    lastFrameTime = now;
+
+    // FPS 窗口统计
+    if (fpsWindowStart === 0) fpsWindowStart = now;
+    var windowElapsed = now - fpsWindowStart;
+    if (windowElapsed >= config.curveInterval) {
+      currentFps = fpsWindowFrames * 1000 / windowElapsed;
+      fpsHistory.push({ t: now, fps: currentFps });
+      if (fpsHistory.length > config.curveWindow) fpsHistory.shift();
+      fpsWindowStart = now;
+      fpsWindowFrames = 0;
+      drawCurve();
+    }
+
+    requestAnimationFrame(frameLoop);
+  }
+
+  // ---------- FPS 曲线（Canvas） ----------
+  var dpr = window.devicePixelRatio || 1;
+
+  function resizeCanvas() {
+    dpr = window.devicePixelRatio || 1;
+    var w = canvas.clientWidth;
+    var h = canvas.clientHeight;
+    if (w === 0 || h === 0) return;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawCurve();
+  }
+
+  function drawCurve() {
+    var w = canvas.clientWidth;
+    var h = canvas.clientHeight;
+    if (w === 0 || h === 0) return;
+    ctx.clearRect(0, 0, w, h);
+
+    var maxFps = 120;
+    // 参考线：60 / 30 FPS
+    ctx.strokeStyle = '#33363f';
+    ctx.lineWidth = 1;
+    [60, 30].forEach(function (v) {
+      var y = h - (v / maxFps) * h;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+      ctx.fillStyle = '#5a5f6c';
+      ctx.font = '10px monospace';
+      ctx.fillText(String(v), 4, y - 2);
+    });
+
+    if (fpsHistory.length < 2) return;
+
+    var step = w / (config.curveWindow - 1);
+    var offset = (config.curveWindow - fpsHistory.length) * step;
+
+    ctx.beginPath();
+    for (var i = 0; i < fpsHistory.length; i++) {
+      var fps = Math.min(fpsHistory[i].fps, maxFps);
+      var x = offset + i * step;
+      var y = h - (fps / maxFps) * h;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = '#6ee7a0';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // 填充区域
+    ctx.lineTo(offset + (fpsHistory.length - 1) * step, h);
+    ctx.lineTo(offset, h);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(110, 231, 160, 0.12)';
+    ctx.fill();
+  }
+
+  // ---------- HUD 定时刷新 ----------
+  function updateHud() {
+    if (!monitorRunning) return;
+    fpsEl.textContent = currentFps.toFixed(0);
+    fpsEl.className = 'value' + (currentFps >= 50 ? '' : currentFps >= 25 ? ' warn' : ' bad');
+    droppedEl.textContent = String(droppedFrames);
+    droppedEl.className = 'value' + (droppedFrames === 0 ? '' : ' warn');
+    longestEl.textContent = longestFrame.toFixed(1) + ' ms';
+    longestEl.className = 'value' + (longestFrame < 50 ? '' : longestFrame < 200 ? ' warn' : ' bad');
+    renderedEl.textContent = renderedCount.toLocaleString();
+    setTimeout(updateHud, config.hudInterval);
+  }
+  setTimeout(updateHud, config.hudInterval);
+
+  // ---------- 分批渲染 10 万条 ----------
+  var renderedCount = 0;
+  var fragBatch;
+
+  function renderBatch() {
+    var frag = document.createDocumentFragment();
+    var end = Math.min(renderedCount + config.batchSize, TOTAL);
+    for (var i = renderedCount; i < end; i++) {
+      var div = document.createElement('div');
+      div.className = 'row';
+      div.textContent = '列表项 #' + (i + 1) + ' — 纯文本内容，用于滚动性能测试';
+      frag.appendChild(div);
+    }
+    container.appendChild(frag);
+    renderedCount = end;
+
+    if (renderedCount < TOTAL) {
+      statusBar.textContent = '渲染中 ' + renderedCount.toLocaleString() + ' / ' + TOTAL.toLocaleString();
+      requestAnimationFrame(renderBatch);
+    } else {
+      statusBar.textContent = '就绪 · 共 ' + TOTAL.toLocaleString() + ' 条';
+    }
+  }
+
+  // ---------- 布局：列表容器高度随 HUD / 窗口变化 ----------
+  function layout() {
+    container.style.top = hud.offsetHeight + 'px';
+    resizeCanvas();
+  }
+
+  // 窗口大小变化：重排 + 重设画布，监控不中断
+  var resizeTimer = 0;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(layout, 100);
+    layout(); // 立即执行一次保证视觉连贯，防抖收尾
+  });
+
+  if (window.ResizeObserver) {
+    new ResizeObserver(function () { layout(); }).observe(hud);
+  }
+
+  // ---------- 后台标签页恢复 ----------
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      hiddenAt = performance.now();
+    } else {
+      // 恢复时重置帧计时基准，避免挂起时长被计入最长单帧 / 掉帧
+      lastFrameTime = 0;
+      fpsWindowStart = 0;
+      fpsWindowFrames = 0;
+      budgetSamples.length = 0;
+      // 清空恢复前的曲线，避免曲线出现误导性深谷
+      fpsHistory.length = 0;
+      statusBar.textContent = '后台恢复 · 统计基准已重置';
+      setTimeout(function () {
+        statusBar.textContent = renderedCount >= TOTAL
+          ? '就绪 · 共 ' + TOTAL.toLocaleString() + ' 条'
+          : '渲染中 ' + renderedCount.toLocaleString() + ' / ' + TOTAL.toLocaleString();
+      }, 2000);
+    }
+  });
+
+  // ---------- 快速滚动：仅做轻量记录，不阻塞 ----------
+  var lastScrollTop = 0;
+  var scrollVelocity = 0;
+  container.addEventListener('scroll', function () {
+    var st = container.scrollTop;
+    scrollVelocity = Math.abs(st - lastScrollTop);
+    lastScrollTop = st;
+  }, { passive: true });
+
+  // ---------- 运行时自适应降级 ----------
+  // 若连续 5 秒 FPS 低于 20，自动切换到降级采样
+  var lowFpsSeconds = 0;
+  setInterval(function () {
+    if (lowEnd) return;
+    if (currentFps > 0 && currentFps < 20) {
+      lowFpsSeconds++;
+      if (lowFpsSeconds >= 5) {
+        lowEnd = true;
+        config.hudInterval = 500;
+        config.curveInterval = 200;
+        config.curveWindow = 150;
+        modeEl.textContent = '自动降级';
+        modeEl.classList.add('warn');
+      }
+    } else {
+      lowFpsSeconds = 0;
+    }
+  }, 1000);
+
+  // ---------- 启动 ----------
+  layout();
+  requestAnimationFrame(function (t) {
+    lastFrameTime = t;
+    requestAnimationFrame(frameLoop);
+    requestAnimationFrame(renderBatch);
+  });
+})();
+</script>
+</body>
+</html>
